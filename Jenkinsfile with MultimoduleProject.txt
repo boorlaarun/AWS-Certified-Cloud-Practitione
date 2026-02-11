@@ -1,0 +1,372 @@
+def artifactId = ""
+def version = ""
+def applicationName = ""
+def applicationNameWithoutExtn = ""
+def artifactRepo = ""
+def containerName = ""
+def sonarProjectKey = ""
+def basePath = "/var/www/html/htdocs"
+def reportServerbasePath = "http://172.178.0.178:8091/htdocs"
+
+def JunitReportPath = "http://172.178.0.178:8091/htdocs/JUnit_Reports"
+def CodeCoverageReportPath = "http://172.178.0.178:8091/htdocs/Coverage_Reports"
+def SASTReportPath = "http://172.178.0.178:8091/htdocs/SAST_Reports"
+def SBOMReportPath = "http://172.178.0.178:8091/htdocs/SBOM_Reports"
+def JenkinsBuildUrl = "http://172.178.0.178:8091/jenkins/job"   
+def SonarQubeUrl = "http://172.178.0.251:9000/dashboard?id="
+
+pipeline {
+    agent any
+
+    stages {
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+                echo "✅ Workspace cleaned"
+            }
+        }
+    stage('Checkout Code') {
+            steps {
+                checkout scm
+                echo "✅ Code checked out"
+            }
+        }
+    stage('Extract POM Info') {
+       steps {
+         dir('transxt-router') {
+        script {
+            def pom = readMavenPom file: 'pom.xml'
+            artifactId = pom.artifactId
+            version = pom.version
+
+            def branch = env.BRANCH_NAME ?: "main"
+            branch = branch.replaceAll("/", "_").replaceAll(" ", "-")
+
+            // Assign sonarProjectKey to env variable
+            env.sonarProjectKey = "${artifactId}-${branch}"
+            containerName = env.sonarProjectKey
+            applicationName = "${artifactId}-${version}.war"
+            applicationNameWithoutExtn = "${artifactId}-${version}"
+            artifactRepo = version.contains("SNAPSHOT") ? "libs-snapshot-local" : "libs-release-local"
+
+            // Get workspace name and base directory
+            def workspaceName = sh(script: "basename \$PWD", returnStdout: true).trim()
+            def baseDir = sh(script: "dirname \$PWD", returnStdout: true).trim()
+
+            // Assign to environment variables
+            env.WORKSPACE_NAME = workspaceName
+            env.BASE_DIR = baseDir
+
+            // Derive base project name (without branch) from JOB_NAME
+            def parts = (env.JOB_NAME ?: '').split('/')
+            env.JENKINS_PROJECT_NAME = (parts.size() >= 2) ? parts[-2] : parts[0]
+
+            // Print POM info
+            echo "artifactId = ${artifactId}"
+            echo "version = ${version}"
+            echo "applicationName = ${applicationName}"
+            echo "artifactRepo = ${artifactRepo}"
+            echo "applicationNameWithoutExtn = ${applicationNameWithoutExtn}"
+            echo "sonarProjectKey = ${env.sonarProjectKey}"
+
+            // Print Jenkins environment variables
+            echo "workspaceName = ${env.WORKSPACE_NAME}"
+            echo "Base Project Name = ${env.JENKINS_PROJECT_NAME}"
+            echo "baseDir = ${env.BASE_DIR}"
+            echo "jobName = ${env.JOB_NAME}"
+            echo "buildNumber = ${env.BUILD_NUMBER}"
+            echo "branchName = ${env.BRANCH_NAME ?: 'main'}"
+        }
+    }
+ }
+}
+       stage('Build & Test') {
+            steps {
+               dir('transxt-router') {
+                sh '''
+                    export JAVA_HOME=/home/devci/jdk1.8.0_461
+                    export PATH=$PATH:/home/devci/apache-maven-3.9.11/bin:/home/jenkins/jdk1.8.0_461/bin:/bin:/usr/bin
+                    java -version
+                    mvn -version
+                    mvn clean
+                    mvn test
+                    mvn surefire-report:report
+                    mvn jacoco:report
+                    mvn package -DskipTests
+               '''
+            }
+        } 
+}
+      stage('SonarQube Analysis') {
+            steps {
+                dir('transxt-router') {
+                script {
+                    withCredentials([string(credentialsId: 'SonarQube', variable: 'Sonartoken')]) {
+                        sh """
+                            export JAVA_HOME=/home/devci/jdk1.8.0_461
+                            export PATH=$PATH:/home/devci/apache-maven-3.9.11/bin:/home/jenkins/jdk1.8.0_461/bin:/bin:/usr/bin
+                            mvn sonar:sonar \
+                                -Dsonar.host.url=http://172.178.0.251:9000 \
+                                -Dsonar.projectName=${env.sonarProjectKey} \
+                                -Dsonar.projectKey=${env.sonarProjectKey} \
+                                -Dsonar.login=${Sonartoken}
+                        """
+                    }
+                }
+           
+        }
+}
+stage('Upload Artifacts to JFrog') {
+    steps {
+         dir('transxt-router') {
+        script {
+            def branch = (env.BRANCH_NAME ?: '').trim()
+            if (branch == 'main') {
+                echo "✅ Branch is 'main'. Proceeding with artifact upload..."
+                sh """
+                    export JAVA_HOME=/home/devci/jdk1.8.0_461
+                    export PATH=\$PATH:/home/devci/apache-maven-3.9.11/bin:/home/jenkins/jdk1.8.0_461/bin:/bin:/usr/bin
+                    mvn deploy \
+                        -DaltDeploymentRepository=central::default::http://172.178.0.251:8081/artifactory/${artifactRepo} \
+                        -DskipTests
+                """
+                echo "✅ Artifact upload completed successfully."
+            } else {
+                echo "ℹ️ Skipping artifact upload. Only 'main' is allowed. Current branch: '${branch}'"
+            }
+        }
+    }
+}
+}
+stage('Snyk Scan Report') {
+  steps {
+     dir('transxt-router') {
+    script {
+      withCredentials([string(credentialsId: 'SNYK_TOKEN', variable: 'SNYK_TOKEN')]) {
+        sh """
+          set -e
+
+          # Use Node v18 from NVM
+          export PATH="/home/devci/.nvm/versions/node/v18.20.8/bin:\$PATH"
+
+          # Set Java and Maven paths
+          export JAVA_HOME="/home/devci/jdk1.8.0_461"
+          export PATH="\$PATH:/home/devci/apache-maven-3.9.11/bin:/home/jenkins/jdk1.8.0_461/bin:/bin:/usr/bin"
+
+          # Authenticate Snyk (via Jenkins secret)
+          snyk auth "${SNYK_TOKEN}"
+
+          # Run Snyk and capture JSON (don't fail the stage here)
+          snyk test --all-projects --json > snyk-report.json || true
+
+          # Generate HTML report
+          snyk-to-html -i snyk-report.json -o "Snyk-${env.WORKSPACE_NAME}-report.html"
+        """
+      }
+    }
+  }
+}
+}
+stage('Generate SBOM Report') {
+    steps {
+        dir('transxt-router') {
+        script {
+            try {
+                echo "✅ Generating SBOM using CycloneDX"
+
+                sh '''
+                    export JAVA_HOME="/home/devci/jdk1.8.0_461"
+                    export PATH="$PATH:/home/devci/apache-maven-3.9.11/bin:/home/jenkins/jdk1.8.0_461/bin:/bin:/usr/bin"
+
+                    # Generate SBOM JSON
+                    mvn org.cyclonedx:cyclonedx-maven-plugin:2.7.9:makeAggregateBom \
+                        -DoutputFormat=json \
+                        -DoutputDirectory=target
+
+                    # Generate SBOM HTML using Python (use real HTML tags; no external packages)
+                    python3 - <<'EOF'
+import json
+from datetime import datetime, timezone, timedelta
+date = datetime.now().strftime("%d-%b-%y at %I:%M%p")
+
+# CSS Styling
+style = """
+<style>
+body { font-family: Arial, sans-serif; margin: 20px; }
+h2 { color: #2c3e50; }
+p { font-size: 14px; color: #34495e; }
+table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+th { background-color: #2980b9; color: white; padding: 8px; text-align: left; }
+td { background-color: #ecf0f1; padding: 8px; }
+tr:nth-child(even) td { background-color: #dfe6e9; }
+code { background: #f6f8fa; padding: 2px 4px; border-radius: 4px; }
+</style>
+"""
+# SBOM HTML
+with open('target/bom.json') as f:
+    sbom = json.load(f)
+
+# Correct HTML tags (not &lt; / &gt;)
+sbom_html = f"<html><head>{style}</head><body>"
+# ✅ please write  project name here ✅
+sbom_html += f"<h2>SBOM Report for Project:- -bbps-cou_main </h2>"
+sbom_html += f"<p><b>Generated On (IST):</b> {date}</p>"
+sbom_html += "<table>"
+sbom_html += "<tr><th>Name</th><th>Group</th><th>Version</th><th>PURL</th><th>Description</th></tr>"
+
+# Correct escaping: escape raw &, <, >
+def esc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+for comp in sbom.get('components', []):
+    sbom_html += "<tr>"
+    sbom_html += f"<td>{esc(comp.get('name','N/A'))}</td>"
+    sbom_html += f"<td>{esc(comp.get('group','N/A'))}</td>"
+    sbom_html += f"<td>{esc(comp.get('version','N/A'))}</td>"
+    sbom_html += f"<td><code>{esc(comp.get('purl','N/A'))}</code></td>"
+    sbom_html += f"<td>{esc(comp.get('description','N/A'))}</td>"
+    sbom_html += "</tr>"
+
+sbom_html += "</table></body></html>"
+
+with open('target/sbom.html','w') as f:
+    f.write(sbom_html)
+EOF
+                '''
+                echo "✅ SBOM HTML report generated successfully."
+            } catch (Exception e) {
+                echo "❌ Failed to generate SBOM report: ${e.getMessage()}"
+                currentBuild.result = 'FAILURE'
+            }
+        }
+    }
+}
+}
+  stage('Send Reports to Server') {
+            steps {
+                dir('transxt-router') {
+                script {
+                    def workspaceName = sh(script: "basename \$PWD", returnStdout: true).trim()
+                    def buildNo = env.BUILD_NUMBER
+
+                    // Base directories
+                    def junitBase = "${basePath}/JUnit_Reports/${workspaceName}/${buildNo}"
+                    def coverageBase = "${basePath}/Coverage_Reports/${workspaceName}/${buildNo}"
+                    def SAST_Reports = "${basePath}/SAST_Reports/${workspaceName}/${buildNo}"
+                    def SBOM_Report = "${basePath}/SBOM_Reports/${workspaceName}/${buildNo}"
+
+                    sh "mkdir -p ${junitBase} ${coverageBase} ${SAST_Reports} ${SBOM_Report}"
+
+                    // Ignore unwanted folders
+                    def modules = sh(script: "find . -maxdepth 1 -type d ! -name '.' ! -name '.*'", returnStdout: true).trim().split("\n")
+                    def ignoreList = ['sql', 'ext-resources', 'target', 'src']
+
+                    for (module in modules) {
+                        def moduleName = module.replaceFirst("^\\./", "")
+                        if (!ignoreList.contains(moduleName)) {
+                            echo "Processing module: ${moduleName}"
+                            def junitTarget = "${junitBase}/${moduleName}"
+                            def coverageTarget = "${coverageBase}/${moduleName}"
+
+                            sh """
+                                mkdir -p '${junitTarget}' '${coverageTarget}'
+                                if [ -d '${module}/target/reports' ] && [ "\$(ls -A '${module}/target/reports' 2>/dev/null)" ]; then
+                                    cp -r '${module}/target/reports/.' '${junitTarget}/'
+                                fi
+                                if [ -d '${module}/target/site/jacoco' ] && [ "\$(ls -A '${module}/target/site/jacoco' 2>/dev/null)" ]; then
+                                    cp -r '${module}/target/site/jacoco/.' '${coverageTarget}/'
+                                fi
+                                
+                                chmod -R 755 '${junitTarget}' '${coverageTarget}'
+                            """
+                        } else {
+                            echo "Skipping folder: ${moduleName}"
+                        }
+                    }
+
+                    // Copy SAST and SBOM reports
+                    sh """
+                        if ls *.html 1>/dev/null 2>&1; then
+                            cp *.html '${SAST_Reports}/'
+                        fi
+                        if [ -f 'target/sbom.html' ]; then
+                            cp 'target/sbom.html' '${SBOM_Report}/'
+                        fi
+                        chmod -R 755 '${SAST_Reports}' '${SBOM_Report}'
+                        chmod -R 755 '${basePath}'
+                    """
+                    // Dynamic report URLs
+                    def JunitReportLink = "$JunitReportPath/${env.WORKSPACE_NAME}/${env.BUILD_NUMBER}"
+                    def CodeCoverageReportLink = "$CodeCoverageReportPath/${env.WORKSPACE_NAME}/${env.BUILD_NUMBER}"
+                    def SASTReportLink = "$SASTReportPath/${env.WORKSPACE_NAME}/${env.BUILD_NUMBER}"
+                    def SBOMReportLink = "$SBOMReportPath/${env.WORKSPACE_NAME}/${env.BUILD_NUMBER}"
+
+                    }
+        }
+}
+}
+  stage('Send Email') {
+            steps {
+                 dir('transxt-router') {
+                    script {
+                        def date = new Date()
+                        def formattedDate = date.format('d MMMM yyyy')
+                        def mailContent = """
+                            <html>
+                            <body>
+                                <br>
+                                <p>     Build ${env.BUILD_NUMBER} for job ${env.JOB_NAME} has successfully completed ✅</b></p>
+                                <br>
+                                                             ----------- Report Links ----------
+                                <br>
+                                <table>
+                                <tr><td>JUnit Report :</td><td><a href="$JunitReportPath/${env.WORKSPACE_NAME}/${env.BUILD_NUMBER}">$JunitReportPath/${env.WORKSPACE_NAME}/${env.BUILD_NUMBER}</a></td></tr>
+                                <tr><td>Code-Coverage Report :</td><td><a href="$CodeCoverageReportPath/${env.WORKSPACE_NAME}/${env.BUILD_NUMBER}">$CodeCoverageReportPath/${env.WORKSPACE_NAME}/${env.BUILD_NUMBER}</a></td></tr>
+                                <tr><td>SAST Report :</td><td><a href="$SASTReportPath/${env.WORKSPACE_NAME}/${env.BUILD_NUMBER}">$SASTReportPath/${env.WORKSPACE_NAME}/${env.BUILD_NUMBER}</a></td></tr>
+                                <tr><td>SBOM Report :</td><td><a href="$SBOMReportPath/${env.WORKSPACE_NAME}/${env.BUILD_NUMBER}">$SBOMReportPath/${env.WORKSPACE_NAME}/${env.BUILD_NUMBER}</a></td></tr>
+                                <tr><td>JenkinsBuild :</td><td><a href="$JenkinsBuildUrl/${env.JENKINS_PROJECT_NAME}/job/${env.BRANCH_NAME}/${env.BUILD_NUMBER}/console">$JenkinsBuildUrl/${env.JENKINS_PROJECT_NAME}/job/${env.BRANCH_NAME}/${env.BUILD_NUMBER}/console</a></td></tr>
+                                <tr><td>SonarQube :</td><td><a href="$SonarQubeUrl${env.sonarProjectKey}">$SonarQubeUrl${env.sonarProjectKey}</a></td></tr>
+                                </table>
+                                                --------------Please Connect to VPN to Access The above Reports ------------------
+                                
+                                <br>
+                            </body>
+                            </html>
+                        """
+                        def replytoEmail = "devsecops@mobilewaretech.com"
+                        def subject = "Build Reports-${env.JOB_NAME} #${env.BUILD_NUMBER} - ${formattedDate}" 
+                        def toEmail = "arun.boorla@mt.com"                                                                                           
+                        def fromEmail = "devsecops@mt.com"
+                        echo "Subject: $subject"
+                        echo "Email body: "
+                        echo "$mailContent"
+    
+                        emailext(
+                            body: mailContent,
+                            mimeType: 'text/html',
+                            replyTo: replytoEmail,
+                            subject: subject,
+                            to: toEmail,
+                            from: fromEmail,
+                            attachLog: false,
+                            attachmentsPattern: '*.html, target/*.html'
+
+                            
+                        )
+                    }
+                }
+            }
+        }
+}
+       post {
+        always {
+            dir('transxt-router') {
+            script {
+                echo "📦 Archiving WAR artifact..."
+            }
+            archiveArtifacts artifacts: '**/*.war', fingerprint: true
+            echo "✅ WAR file archived and available for download from Jenkins."
+        }
+    }
+  }
+}
